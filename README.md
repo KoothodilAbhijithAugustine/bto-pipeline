@@ -108,9 +108,9 @@ Parsed and split FITS files, converted from binary with GPS→UTC time conversio
 
 | File Pattern | Contents | Cadence |
 |---|---|---|
-| `csYYMMDDbto.hk` | Housekeeping + Bootloader | Hourly |
-| `csYYMMDDbto.lc` | Histograms | Hourly |
-| *(light curves)* | Light curves | Hourly |
+| `csYYMMDDbto.hk` | Housekeeping + Bootloader | Daily |
+| `csYYMMDDbto.lc` | Histograms | Daily |
+| *(light curves)* | Light curves | Daily |
 | `csYYMMDDXXXt_bto.evt` | Events / photon list (TTE) | Per event (`XXX` = fraction of day, `t` = trigger ID) |
 
 ---
