@@ -5,18 +5,69 @@ Data processing pipeline for the BTO instrument, transforming raw spacecraft tel
 ---
 
 ## Table of Contents
-
-- [Pipeline Overview](#pipeline-overview)
-- [Data Levels](#data-levels)
 - [Getting Started](#getting-started)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Repository Structure](#repository-structure)
+- [Pipeline Overview](#pipeline-overview)
+- [Data Levels](#data-levels)
 - [Contributing](#contributing)
 - [Open Decisions](#open-decisions)
 
 ---
 
+## Getting Started
+
+> **Placeholder** — detailed quickstart instructions will be added once the environment is stable.
+
+You will need:
+- Python ≥ 3.10
+- `astropy`, `numpy`, `fitsio` *(full list in `requirements.txt`)*
+- Access to the HEASARC CALDB for calibration files
+
+```bash
+# Clone the repository
+git clone https://github.com/<org>/bto-pipeline.git
+cd bto-pipeline
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+---
+
+## Usage
+
+> **Placeholder** — command-line interface and example runs will be documented here.
+
+```bash
+# Example: Process a day of raw telemetry through L0 → L1a
+python run_pipeline.py --input /data/raw/2024/01/15 --level l1a
+
+# Example: Apply calibration to produce L1b products
+python run_pipeline.py --input /data/l1a/2024/01/15 --level l1b
+```
+
+---
+
+## Repository Structure
+
+> **Placeholder** — update once the directory layout is finalised.
+
+```
+bto-pipeline/
+├── l0/                  # L0 binary processing
+├── l1a/                 # L1a FITS conversion
+├── l1b/                 # L1b calibration
+├── l2/                  # L2 science products
+├── caldb/               # Local calibration file handling
+├── utils/               # Shared utilities (time conversion, checksum, etc.)
+├── tests/               # Unit and integration tests
+├── docs/                # Additional documentation
+└── README.md
+```
+
+--- 
 ## Pipeline Overview
 
 Raw telemetry received from the spacecraft is ingested, verified, and progressively calibrated through the following stages:
@@ -97,56 +148,6 @@ Time-stamped raw and calibrated data (housekeeping + histograms) are ingested in
 
 ---
 
-## Getting Started
-
-> **Placeholder** — detailed quickstart instructions will be added once the environment is stable.
-
-You will need:
-- Python ≥ 3.10
-- `astropy`, `numpy`, `fitsio` *(full list in `requirements.txt`)*
-- Access to the HEASARC CALDB for calibration files
-
-```bash
-# Clone the repository
-git clone https://github.com/<org>/bto-pipeline.git
-cd bto-pipeline
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
----
-
-## Usage
-
-> **Placeholder** — command-line interface and example runs will be documented here.
-
-```bash
-# Example: Process a day of raw telemetry through L0 → L1a
-python run_pipeline.py --input /data/raw/2024/01/15 --level l1a
-
-# Example: Apply calibration to produce L1b products
-python run_pipeline.py --input /data/l1a/2024/01/15 --level l1b
-```
-
----
-
-## Repository Structure
-
-> **Placeholder** — update once the directory layout is finalised.
-
-```
-bto-pipeline/
-├── l0/                  # L0 binary processing
-├── l1a/                 # L1a FITS conversion
-├── l1b/                 # L1b calibration
-├── l2/                  # L2 science products
-├── caldb/               # Local calibration file handling
-├── utils/               # Shared utilities (time conversion, checksum, etc.)
-├── tests/               # Unit and integration tests
-├── docs/                # Additional documentation
-└── README.md
-```
 
 ---
 
