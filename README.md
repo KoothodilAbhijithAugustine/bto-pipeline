@@ -27,7 +27,7 @@ You will need:
 
 ```bash
 # Clone the repository
-git clone https://github.com/<org>/bto-pipeline.git
+git clone https://github.com/cositools/bto-pipeline.git
 cd bto-pipeline
 
 # Install dependencies
