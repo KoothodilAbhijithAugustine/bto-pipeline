@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+BTO MASTER PIPELINE (CLI EDITION)
+Monitors or batch-processes CCSDS hex logs into L0, L1a, and L1b FITS archives.
+Supports live daemon mode and selective processing tiers.
+"""
 
 import sys
 import re
@@ -42,11 +47,6 @@ def pps_to_utc(pps_sec: int, ticks: int = 0) -> datetime.datetime:
 def get_met(dt_utc: datetime.datetime) -> float:
     return (dt_utc - MET_EPOCH).total_seconds()
 
-def get_day_fraction(dt_utc: datetime.datetime) -> str:
-    """Calculates the millisecond fraction of the current day for event file naming."""
-    sec_mid = (dt_utc - dt_utc.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
-    return f"{int((sec_mid / 86400.0) * 1000):03d}"
-
 class ArchiveRouter:
     """Manages FITS file paths. HK/LC are daily; EVT is split by Trigger ID."""
     def __init__(self, root="BTO_Data_Archive"):
@@ -67,8 +67,8 @@ class ArchiveRouter:
             elif apid == 0xD8: 
                 fname = f"cs{yymmdd}bto_hk.fits"
             elif apid == 0xD7: 
-                # RESTORED: Event files are uniquely split by Time Fraction and Trigger ID
-                fname = f"cs{yymmdd}_{get_day_fraction(dt)}_{tid:05d}_bto_evt.fits"
+                # EVENT FILES: Grouped strictly by Day and persistent Trigger ID
+                fname = f"cs{yymmdd}_{tid:05d}_bto_evt.fits"
             else:              
                 fname = f"cs{yymmdd}_misc.fits"
             
@@ -94,6 +94,9 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     utc_dt = pps_to_utc(sec, tks)
     met = get_met(utc_dt)
     
+    # Calculate base 64-bit Unix time for the packet
+    unix_time_base = utc_dt.timestamp()
+    
     base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": met}
 
     if apid == 0x0D8:
@@ -101,8 +104,8 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
         t_det   = int.from_bytes(ccsds[HK_T_DET_OFS : HK_T_DET_OFS + HK_T_LEN], "big")
         base_data.update({
             "type": "HK",
-            "l1a": [{"TIME": met, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det}],
-            "l1b": [{"TIME": met, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det, "t_ext": (t_board * CAL_HK['EXT'][0]) + CAL_HK['EXT'][1], "t_det1": (t_det * CAL_HK['DET'][0]) + CAL_HK['DET'][1]}]
+            "l1a": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det}],
+            "l1b": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det, "t_ext": (t_board * CAL_HK['EXT'][0]) + CAL_HK['EXT'][1], "t_det1": (t_det * CAL_HK['DET'][0]) + CAL_HK['DET'][1]}]
         })
         return base_data
         
@@ -110,40 +113,56 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
         raw_bins = [int.from_bytes(ccsds[LC_BINS_START + (i*LC_BINS_STEP) : LC_BINS_START + (i*LC_BINS_STEP) + LC_BINS_STEP], "big") for i in range(LC_NUM_BINS)]
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": met, "PKT_CNT": pkt_count, "bins": raw_bins}], 
-            "l1b": [{"TIME": met, "PKT_CNT": pkt_count, "bins": raw_bins, "RATES": [float(b) for b in raw_bins]}]
+            "l1a": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "bins": raw_bins}], 
+            "l1b": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "bins": raw_bins, "RATES": [float(b) for b in raw_bins]}]
         })
         return base_data
         
     elif apid == 0x0D7:
-        l1a, l1b, tid = [], [], 0
+        l1a, l1b = [], []
         ptr = EVT_DATA_START
+        
         while ptr <= len(ccsds) - EVT_WORD_LEN:
             word = int.from_bytes(ccsds[ptr : ptr + EVT_WORD_LEN], "big")
-            adc, ts_long = (word >> 48) & 0xFFFF, (word >> 32) & 0xFFFF
-            if adc == 0xABCD and ts_long == 0xABCD:
+            adc = (word >> 48) & 0xFFFF
+            
+            # --- TRAP 1: Filter ALL versions of the End Frame marker ---
+            if adc in (0xABCD, 0x0123):
                 d7_state['pps_time'] = ((word & 0xFFFF) << 16) | ((word >> 16) & 0xFFFF)
+                
                 if ptr + (EVT_WORD_LEN * 3) <= len(ccsds):
                     w3 = int.from_bytes(ccsds[ptr + (EVT_WORD_LEN * 2) : ptr + (EVT_WORD_LEN * 3)], "big")
                     d7_state['dwt_at_last_pps'] = ((w3 & 0xFFFF) << 16) | ((w3 >> 16) & 0xFFFF)
-                    ptr += (EVT_WORD_LEN * 3); continue
+                    
+                    # Safely skip all 3 fake photons (24 bytes)
+                    ptr += (EVT_WORD_LEN * 3)
+                    continue
+                    
+            # --- TRAP 2: Store Trigger ID in persistent state across packets ---
             elif (adc & 0x7FFF) == 0x7FFF: 
-                tid = (word & 0xFFFF) & 0x3FFF # Extract exact trigger ID
+                d7_state['current_tid'] = (word & 0xFFFF) & 0x3FFF
+                
             else:
                 pha, dead_tid = adc & 0x0FFF, word & 0xFFFF 
                 photon_dwt_32 = ((word >> 16) & 0xFFFFFF) << 8
+                
                 if d7_state['pps_time'] > 0:
                     delta_dwt = (photon_dwt_32 - d7_state['dwt_at_last_pps']) & 0xFFFFFFFF
                     if delta_dwt > 0x7FFFFFFF: delta_dwt -= 0x100000000 
-                    abs_met = get_met(pps_to_utc(d7_state['pps_time']) + datetime.timedelta(seconds=delta_dwt * DWT_TICK_SEC))
-                else: abs_met = met 
+                    # Calculate precise photon Unix time
+                    abs_utc = pps_to_utc(d7_state['pps_time']) + datetime.timedelta(seconds=delta_dwt * DWT_TICK_SEC)
+                    evt_unix_time = abs_utc.timestamp()
+                else: 
+                    evt_unix_time = unix_time_base 
                 
-                l1a.append({"TIME": abs_met, "PKT_CNT": pkt_count, "PHA": pha, "DEADTIME": dead_tid})
-                l1b.append({"TIME": abs_met, "PKT_CNT": pkt_count, "PI": pha})
+                l1a.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PHA": pha, "DEADTIME": dead_tid})
+                l1b.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PI": pha})
                 
             ptr += EVT_WORD_LEN
             
-        base_data.update({"type": "EVT", "l1a": l1a, "l1b": l1b, "tid": tid})
+        # Retrieve the sticky TID for the router
+        active_tid = d7_state.get('current_tid', 0)
+        base_data.update({"type": "EVT", "l1a": l1a, "l1b": l1b, "tid": active_tid})
         return base_data
         
     return None
@@ -163,8 +182,11 @@ def get_ebounds_hdu():
 def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False):
     obs_id = f"{utc_start.strftime('%y%m%d')}000t"
     header_data = {'TELESCOP': ('COSI', 'Telescope'), 'INSTRUME': ('BTO', 'Instrument'), 'OBS_ID': (obs_id, 'Observation ID'), 'DATE-OBS': (utc_start.strftime('%Y-%m-%dT%H:%M:%S'), 'Start'), 'DATE-END': (utc_stop.strftime('%Y-%m-%dT%H:%M:%S'), 'End')}
-    if is_primary: header_data.update({'ORIGIN': ('UCB/SSL', 'Origin'), 'DATE': (datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'), 'Created'), 'CREATOR': ('BTO_LIVE_V1', 'Software')})
-    else: header_data.update({'HDUCLASS': ('OGIP', 'Standard'), 'DATAMODE': ('NORMAL', 'Datamode'), 'OBSERVER': ('BTO_TEAM', 'PI'), 'OBJECT': ('CAL_SOURCE', 'Target'), 'TIMESYS': ('TT', 'Time System'), 'MJDREFI': (60676, 'MJD Ref'), 'MJDREFF': (0.0008007407407407, 'MJD offset'), 'TIMEREF': ('LOCAL', 'Ref Frame'), 'TASSIGN': ('SATELLITE', 'Time clock'), 'TIMEUNIT': ('s', 'Time unit'), 'TSTART': (t_start, 'Start MET'), 'TSTOP': (t_stop, 'Stop MET'), 'CLOCKAPP': ('F', 'Clock corr?')})
+    if is_primary: 
+        header_data.update({'ORIGIN': ('UCB/SSL', 'Origin'), 'DATE': (datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'), 'Created'), 'CREATOR': ('BTO_LIVE_V1', 'Software')})
+    else: 
+        # TIMESYS updated to UNIX, and MJDREFI updated to 40587 (Jan 1, 1970)
+        header_data.update({'HDUCLASS': ('OGIP', 'Standard'), 'DATAMODE': ('NORMAL', 'Datamode'), 'OBSERVER': ('BTO_TEAM', 'PI'), 'OBJECT': ('CAL_SOURCE', 'Target'), 'TIMESYS': ('UNIX', 'Time System'), 'MJDREFI': (40587, 'MJD Ref'), 'MJDREFF': (0.0, 'MJD offset'), 'TIMEREF': ('LOCAL', 'Ref Frame'), 'TASSIGN': ('SATELLITE', 'Time clock'), 'TIMEUNIT': ('s', 'Time unit'), 'TSTART': (t_start, 'Start MET'), 'TSTOP': (t_stop, 'Stop MET'), 'CLOCKAPP': ('F', 'Clock corr?')})
     for key, (val, comment) in header_data.items(): hdu.header[key] = (val, comment)
 
 def flush_cache_to_disk(cache, tier):
@@ -182,7 +204,7 @@ def flush_cache_to_disk(cache, tier):
             
         cols = []
         for k in data['rows'][0].keys():
-            if k == 'TIME': fmt = '1D'
+            if k == 'TIME': fmt = '1D' # 64-bit float for Unix Time
             elif k == 'RATES': fmt = f'{LC_NUM_BINS}E'
             elif k == 'bins': fmt = f'{LC_NUM_BINS}J'
             elif k in ['PI', 'PHA', 'PKT_CNT', 't_ext_raw', 't_det1_raw']: fmt = '1I'
@@ -270,7 +292,9 @@ def read_input_stream(target_path, is_live):
 def run_pipeline(input_path: str, levels: list, is_live: bool):
     router = ArchiveRouter()
     cache_a, cache_b = {}, {}
-    d7_timing_state = {'pps_time': 0, 'dwt_at_last_pps': 0}
+    
+    # Initialize current_tid in the persistent state
+    d7_timing_state = {'pps_time': 0, 'dwt_at_last_pps': 0, 'current_tid': 0}
     packet_count = 0
     
     print(f"[*] Target Levels: {', '.join(levels).upper()}")
@@ -290,7 +314,8 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                     p = decode_packet(stream[idx+2:idx+blen-2], apid, d7_timing_state)
                     if p:
                         time_str = p['utc'].strftime('%Y-%m-%d %H:%M:%S')
-                        print(f"[{time_str}] APID 0x{p['apid']:03X} ({p['type']:<3}) | Seq: {p['pkt_count']:05d} | MET: {p['met']:.3f} | Extracted Rows: {len(p['l1a'])}")
+                        tid_str = f" | TID: {p.get('tid', 0):05d}" if p['type'] == 'EVT' else ""
+                        print(f"[{time_str}] APID 0x{p['apid']:03X} ({p['type']:<3}){tid_str} | Seq: {p['pkt_count']:05d} | Extracted Rows: {len(p['l1a'])}")
 
                         # 1. Generate L0 Raw
                         if 'l0' in levels:
