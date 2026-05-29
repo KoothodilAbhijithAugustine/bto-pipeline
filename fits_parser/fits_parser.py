@@ -4,6 +4,7 @@
 BTO MASTER PIPELINE (CLI EDITION)
 Monitors or batch-processes CCSDS hex logs into L0, L1a, and L1b FITS archives.
 Supports live daemon mode and selective processing tiers.
+
 """
 
 import sys
@@ -16,9 +17,6 @@ import argparse
 import numpy as np
 from astropy.io import fits
 
-# =============================================================================
-# 1. MISSION CONSTANTS & OFFSETS
-# =============================================================================
 GPS_EPOCH = datetime.datetime(1980, 1, 6, 0, 0, 0, tzinfo=datetime.timezone.utc)
 MET_EPOCH = datetime.datetime(2025, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
 TICKS_TO_SEC = 1.0 / 40_000_000.0
@@ -36,11 +34,8 @@ LC_BINS_START, LC_BINS_STEP, LC_NUM_BINS = 15, 2, 29
 LC_SEC_OFS, LC_TKS_OFS, LC_TIME_LEN = 77, 81, 4
 EVT_DATA_START, EVT_WORD_LEN = 20, 8
 
-FLUSH_THRESHOLD = 1000  # Number of packets to buffer before flushing to disk
+FLUSH_THRESHOLD = 1000  
 
-# =============================================================================
-# 2. TIME & ROUTING UTILITIES
-# =============================================================================
 def pps_to_utc(pps_sec: int, ticks: int = 0) -> datetime.datetime:
     return GPS_EPOCH + datetime.timedelta(seconds=(float(pps_sec) + ticks * TICKS_TO_SEC))
 
@@ -48,7 +43,6 @@ def get_met(dt_utc: datetime.datetime) -> float:
     return (dt_utc - MET_EPOCH).total_seconds()
 
 class ArchiveRouter:
-    """Manages FITS file paths. HK/LC are daily; EVT is split by Trigger ID."""
     def __init__(self, root="BTO_Data_Archive"):
         self.root = root
 
@@ -62,28 +56,18 @@ class ArchiveRouter:
             fname = f"bto_{yymmdd}_{folder.lower()}.bin"
         else:
             base = os.path.join(self.root, f"{tier}_fits", yyyy, mm, dd)
-            if apid == 0xD6:   
-                fname = f"cs{yymmdd}bto_lc.fits"
-            elif apid == 0xD8: 
-                fname = f"cs{yymmdd}bto_hk.fits"
-            elif apid == 0xD7: 
-                # EVENT FILES: Grouped strictly by Day and persistent Trigger ID
-                fname = f"cs{yymmdd}_{tid:05d}_bto_evt.fits"
-            else:              
-                fname = f"cs{yymmdd}_misc.fits"
+            if apid == 0xD6:   fname = f"cs{yymmdd}bto_lc.fits"
+            elif apid == 0xD8: fname = f"cs{yymmdd}bto_hk.fits"
+            elif apid == 0xD7: fname = f"cs{yymmdd}_{tid:05d}_bto_evt.fits"
+            else:              fname = f"cs{yymmdd}_misc.fits"
             
         os.makedirs(base, exist_ok=True)
         return os.path.join(base, fname)
 
-# =============================================================================
-# 3. PACKET DECODER
-# =============================================================================
 def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     if len(ccsds) < 14: return None
     
-    seq_ctrl = int.from_bytes(ccsds[PKT_SEQ_OFS : PKT_SEQ_OFS + PKT_SEQ_LEN], "big")
-    pkt_count = seq_ctrl & 0x3FFF
-    
+    pkt_count = int.from_bytes(ccsds[PKT_SEQ_OFS : PKT_SEQ_OFS + PKT_SEQ_LEN], "big") & 0x3FFF
     sec = int.from_bytes(ccsds[PKT_SEC_OFS : PKT_SEC_OFS + PKT_SEC_LEN], "big")
     tks = int.from_bytes(ccsds[PKT_TKS_OFS : PKT_TKS_OFS + PKT_TKS_LEN], "big")
     if apid == 0x0D6 and len(ccsds) >= 85: 
@@ -92,84 +76,63 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
     if sec < 1420070400: return None 
     
     utc_dt = pps_to_utc(sec, tks)
-    met = get_met(utc_dt)
+    unix_time = utc_dt.timestamp()
     
-    # Calculate base 64-bit Unix time for the packet
-    unix_time_base = utc_dt.timestamp()
-    
-    base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": met}
+    base_data = {"apid": apid, "pkt_count": pkt_count, "utc": utc_dt, "met": get_met(utc_dt)}
 
     if apid == 0x0D8:
         t_board = int.from_bytes(ccsds[HK_T_BOARD_OFS : HK_T_BOARD_OFS + HK_T_LEN], "big")
         t_det   = int.from_bytes(ccsds[HK_T_DET_OFS : HK_T_DET_OFS + HK_T_LEN], "big")
         base_data.update({
             "type": "HK",
-            "l1a": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det}],
-            "l1b": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det, "t_ext": (t_board * CAL_HK['EXT'][0]) + CAL_HK['EXT'][1], "t_det1": (t_det * CAL_HK['DET'][0]) + CAL_HK['DET'][1]}]
+            "l1a": [{"TIME": unix_time, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det}],
+            "l1b": [{"TIME": unix_time, "PKT_CNT": pkt_count, "t_ext_raw": t_board, "t_det1_raw": t_det, "t_ext": (t_board * CAL_HK['EXT'][0]) + CAL_HK['EXT'][1], "t_det1": (t_det * CAL_HK['DET'][0]) + CAL_HK['DET'][1]}]
         })
         return base_data
         
     elif apid == 0x0D6:
-        raw_bins = [int.from_bytes(ccsds[LC_BINS_START + (i*LC_BINS_STEP) : LC_BINS_START + (i*LC_BINS_STEP) + LC_BINS_STEP], "big") for i in range(LC_NUM_BINS)]
+        raw_bins = [int.from_bytes(ccsds[LC_BINS_START + (i*LC_BINS_STEP) : LC_BINS_START + (i*LC_BINS_STEP) + 2], "big") for i in range(LC_NUM_BINS)]
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "bins": raw_bins}], 
-            "l1b": [{"TIME": unix_time_base, "PKT_CNT": pkt_count, "bins": raw_bins, "RATES": [float(b) for b in raw_bins]}]
+            "l1a": [{"TIME": unix_time, "PKT_CNT": pkt_count, "bins": raw_bins}], 
+            "l1b": [{"TIME": unix_time, "PKT_CNT": pkt_count, "bins": raw_bins, "RATES": [float(b) for b in raw_bins]}]
         })
         return base_data
         
     elif apid == 0x0D7:
         l1a, l1b = [], []
         ptr = EVT_DATA_START
-        
         while ptr <= len(ccsds) - EVT_WORD_LEN:
             word = int.from_bytes(ccsds[ptr : ptr + EVT_WORD_LEN], "big")
             adc = (word >> 48) & 0xFFFF
             
-            # --- TRAP 1: Filter ALL versions of the End Frame marker ---
             if adc in (0xABCD, 0x0123):
                 d7_state['pps_time'] = ((word & 0xFFFF) << 16) | ((word >> 16) & 0xFFFF)
-                
-                if ptr + (EVT_WORD_LEN * 3) <= len(ccsds):
-                    w3 = int.from_bytes(ccsds[ptr + (EVT_WORD_LEN * 2) : ptr + (EVT_WORD_LEN * 3)], "big")
+                if ptr + 24 <= len(ccsds):
+                    w3 = int.from_bytes(ccsds[ptr+16 : ptr+24], "big")
                     d7_state['dwt_at_last_pps'] = ((w3 & 0xFFFF) << 16) | ((w3 >> 16) & 0xFFFF)
-                    
-                    # Safely skip all 3 fake photons (24 bytes)
-                    ptr += (EVT_WORD_LEN * 3)
-                    continue
-                    
-            # --- TRAP 2: Store Trigger ID in persistent state across packets ---
+                    ptr += 24; continue
             elif (adc & 0x7FFF) == 0x7FFF: 
                 d7_state['current_tid'] = (word & 0xFFFF) & 0x3FFF
-                
             else:
                 pha, dead_tid = adc & 0x0FFF, word & 0xFFFF 
-                photon_dwt_32 = ((word >> 16) & 0xFFFFFF) << 8
+                dwt = ((word >> 16) & 0xFFFFFF) << 8
+                dt = (dwt - d7_state['dwt_at_last_pps']) & 0xFFFFFFFF
+                abs_utc = pps_to_utc(d7_state['pps_time']) + datetime.timedelta(seconds=(dt if dt < 0x7FFFFFFF else dt - 0x100000000) * DWT_TICK_SEC)
+                evt_unix_time = abs_utc.timestamp()
                 
-                if d7_state['pps_time'] > 0:
-                    delta_dwt = (photon_dwt_32 - d7_state['dwt_at_last_pps']) & 0xFFFFFFFF
-                    if delta_dwt > 0x7FFFFFFF: delta_dwt -= 0x100000000 
-                    # Calculate precise photon Unix time
-                    abs_utc = pps_to_utc(d7_state['pps_time']) + datetime.timedelta(seconds=delta_dwt * DWT_TICK_SEC)
-                    evt_unix_time = abs_utc.timestamp()
-                else: 
-                    evt_unix_time = unix_time_base 
                 
-                l1a.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PHA": pha, "DEADTIME": dead_tid})
-                l1b.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PI": pha})
+                active_tid = d7_state.get('current_tid', 0)
+                l1a.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PHA": pha, "DEADTIME": dead_tid, "_TID": active_tid})
+                l1b.append({"TIME": evt_unix_time, "PKT_CNT": pkt_count, "PI": pha, "_TID": active_tid})
                 
             ptr += EVT_WORD_LEN
             
-        # Retrieve the sticky TID for the router
-        active_tid = d7_state.get('current_tid', 0)
-        base_data.update({"type": "EVT", "l1a": l1a, "l1b": l1b, "tid": active_tid})
+        base_data.update({"type": "EVT", "l1a": l1a, "l1b": l1b})
         return base_data
-        
     return None
 
-# =============================================================================
-# 4. HEADER & FITS UTILITIES
-# =============================================================================
+
 def get_ebounds_hdu():
     channels = np.arange(MAX_CHANNELS, dtype=np.int16)
     e_min = np.maximum(0, E_SLOPE * (channels - 0.5) + E_INTERCEPT)
@@ -179,126 +142,70 @@ def get_ebounds_hdu():
     hdu.header.update({'EXTNAME': 'EBOUNDS', 'TELESCOP': 'COSI', 'INSTRUME': 'BTO', 'HDUCLASS': 'OGIP', 'HDUCLAS1': 'RESPONSE', 'HDUCLAS2': 'EBOUNDS', 'CHANTYPE': 'PI', 'DETCHANS': MAX_CHANNELS})
     return hdu
 
-def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False):
+def inject_metadata(hdu, utc_start, utc_stop, is_primary=False):
     obs_id = f"{utc_start.strftime('%y%m%d')}000t"
     header_data = {'TELESCOP': ('COSI', 'Telescope'), 'INSTRUME': ('BTO', 'Instrument'), 'OBS_ID': (obs_id, 'Observation ID'), 'DATE-OBS': (utc_start.strftime('%Y-%m-%dT%H:%M:%S'), 'Start'), 'DATE-END': (utc_stop.strftime('%Y-%m-%dT%H:%M:%S'), 'End')}
     if is_primary: 
         header_data.update({'ORIGIN': ('UCB/SSL', 'Origin'), 'DATE': (datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'), 'Created'), 'CREATOR': ('BTO_LIVE_V1', 'Software')})
     else: 
-        # TIMESYS updated to UNIX, and MJDREFI updated to 40587 (Jan 1, 1970)
-        header_data.update({'HDUCLASS': ('OGIP', 'Standard'), 'DATAMODE': ('NORMAL', 'Datamode'), 'OBSERVER': ('BTO_TEAM', 'PI'), 'OBJECT': ('CAL_SOURCE', 'Target'), 'TIMESYS': ('UNIX', 'Time System'), 'MJDREFI': (40587, 'MJD Ref'), 'MJDREFF': (0.0, 'MJD offset'), 'TIMEREF': ('LOCAL', 'Ref Frame'), 'TASSIGN': ('SATELLITE', 'Time clock'), 'TIMEUNIT': ('s', 'Time unit'), 'TSTART': (t_start, 'Start MET'), 'TSTOP': (t_stop, 'Stop MET'), 'CLOCKAPP': ('F', 'Clock corr?')})
+        header_data.update({'HDUCLASS': ('OGIP', 'Standard'), 'DATAMODE': ('NORMAL', 'Datamode'), 'OBSERVER': ('BTO_TEAM', 'PI'), 'OBJECT': ('CAL_SOURCE', 'Target'), 'TIMESYS': ('UNIX', 'Time System'), 'MJDREFI': (40587, 'MJD Ref'), 'MJDREFF': (0.0, 'MJD offset')})
     for key, (val, comment) in header_data.items(): hdu.header[key] = (val, comment)
 
 def flush_cache_to_disk(cache, tier):
     for path, data in list(cache.items()):
-        if not data['met_list']: 
-            del cache[path]; continue
+        if not data['rows']: continue
+        try:
+            cols = []
+            for k in data['rows'][0].keys():
+                fmt = '1D' if k=='TIME' else '1E' if k in ['t_ext', 't_det1', 'RATES'] else '29J' if k=='bins' else '1I' if k in ['PI', 'PHA', 'PKT_CNT', 't_ext_raw', 't_det1_raw'] else '1J'
+                cols.append(fits.Column(name=k, format=fmt, array=np.array([r[k] for r in data['rows']])))
             
-        t_s, t_e = min(data['met_list']), max(data['met_list'])
-        u_s, u_e = MET_EPOCH + datetime.timedelta(seconds=t_s), MET_EPOCH + datetime.timedelta(seconds=t_e)
-        
-        if 'PI' in data['rows'][0] or 'PHA' in data['rows'][0]: ext_name, hdu_class = 'EVENTS', 'EVENTS'
-        elif 't_ext_raw' in data['rows'][0]: ext_name, hdu_class = 'HK', 'HK'
-        elif 'bins' in data['rows'][0]: ext_name, hdu_class = 'SPECTRUM', 'LIGHTCURVE'
-        else: ext_name, hdu_class = 'DATA', 'DATA'
+            new_hdu = fits.BinTableHDU.from_columns(cols, name='EVENTS' if 'PHA' in data['rows'][0] or 'PI' in data['rows'][0] else 'DATA')
             
-        cols = []
-        for k in data['rows'][0].keys():
-            if k == 'TIME': fmt = '1D' # 64-bit float for Unix Time
-            elif k == 'RATES': fmt = f'{LC_NUM_BINS}E'
-            elif k == 'bins': fmt = f'{LC_NUM_BINS}J'
-            elif k in ['PI', 'PHA', 'PKT_CNT', 't_ext_raw', 't_det1_raw']: fmt = '1I'
-            elif k in ['t_ext', 't_det1']: fmt = '1E' 
-            else: fmt = '1J'
             
-            arr = np.array([r[k] for r in data['rows']])
-            if fmt == '1I': arr = arr.astype(np.int16)
-            elif fmt == '1E': arr = arr.astype(np.float32)
-            cols.append(fits.Column(name=k, format=fmt, array=arr))
+            utc_start = datetime.datetime.fromtimestamp(data['rows'][0]['TIME'], tz=datetime.timezone.utc)
+            utc_stop = datetime.datetime.fromtimestamp(data['rows'][-1]['TIME'], tz=datetime.timezone.utc)
+            inject_metadata(new_hdu, utc_start, utc_stop)
             
-        new_hdu = fits.BinTableHDU.from_columns(cols, name=ext_name)
-        inject_metadata(new_hdu, t_s, t_e, u_s, u_e, is_primary=False)
-        new_hdu.header.update({'HDUCLAS1': hdu_class, 'HDUCLAS2': 'ALL'})
-        if ext_name == 'EVENTS' and tier == 'L1b': new_hdu.header.update({'CHANTYPE': 'PI', 'DETCHANS': MAX_CHANNELS})
-
-        # Atomic Save or Append
-        if os.path.exists(path):
-            try:
+            if os.path.exists(path):
                 with fits.open(path, memmap=False) as hdul:
-                    pri_hdr = hdul[0].header.copy()
-                    old_hdu = hdul[1]
-                    new_tstop = max(old_hdu.header.get('TSTOP', t_e), t_e)
-                    
-                    merged_nrows = old_hdu.data.shape[0] + new_hdu.data.shape[0]
-                    merged_hdu = fits.BinTableHDU.from_columns(old_hdu.columns, nrows=merged_nrows, name=old_hdu.name, header=old_hdu.header)
-                    for colname in old_hdu.columns.names:
-                        merged_hdu.data[colname][:] = np.concatenate([old_hdu.data[colname], new_hdu.data[colname]])
-                        
-                    merged_hdu.header['TSTOP'] = new_tstop
-                    pri_hdr['DATE-END'] = u_e.strftime('%Y-%m-%dT%H:%M:%S')
-                    
-                    new_hdulist = [fits.PrimaryHDU(header=pri_hdr), merged_hdu]
-                    if len(hdul) > 2 and hdul[2].name == 'EBOUNDS': new_hdulist.append(hdul[2].copy())
-                    final_hdul = fits.HDUList(new_hdulist)
-                
-                temp_path = path + ".tmp"
-                final_hdul.writeto(temp_path, overwrite=True)
-                os.replace(temp_path, path)
-            except Exception as e:
-                print(f"\n[ERROR] Could not append to {path}. Error: {e}")
-        else:
-            hdul = [fits.PrimaryHDU(), new_hdu]
-            inject_metadata(hdul[0], t_s, t_e, u_s, u_e, is_primary=True)
-            if ext_name == 'EVENTS' and tier == 'L1b': hdul.append(get_ebounds_hdu())
-            fits.HDUList(hdul).writeto(path, overwrite=True)
-            
-        print(f"[DISK IO] {tier} Flushed {len(data['met_list'])} packets to disk: {os.path.basename(path)}")
-        del cache[path] 
+                    old_data = hdul[1].data
+                    new_table = fits.BinTableHDU.from_columns(hdul[1].columns, nrows=len(old_data) + len(data['rows']))
+                    for col in hdul[1].columns.names:
+                        new_table.data[col] = np.concatenate([old_data[col], [r[col] for r in data['rows']]])
+                    final_hdul = fits.HDUList([hdul[0], new_table])
+                    if len(hdul) > 2: final_hdul.append(hdul[2])
+                    final_hdul.writeto(path + ".tmp", overwrite=True)
+                os.replace(path + ".tmp", path)
+            else:
+                hdul = [fits.PrimaryHDU(), new_hdu]
+                if 'PI' in data['rows'][0]: hdul.append(get_ebounds_hdu())
+                fits.HDUList(hdul).writeto(path, overwrite=True)
+            print(f"[DISK IO] {tier} Flushed {len(data['rows'])} events to {os.path.basename(path)}")
+        except Exception as e: print(f"[ERROR] {e}")
+        del cache[path]
 
-# =============================================================================
-# 5. INGESTION ROUTINES (Live & Offline)
-# =============================================================================
 def read_input_stream(target_path, is_live):
     if is_live:
-        if not os.path.isdir(target_path): raise ValueError("Live mode requires a directory path, not a file.")
-        current_file, f = None, None
-        print(f"[*] Live Monitor Active on: {target_path}")
-        
         while True:
             files = sorted(glob.glob(os.path.join(target_path, "*.txt")), key=os.path.getmtime)
-            if not files:
-                time.sleep(1); continue
-            newest_file = files[-1]
-            if current_file != newest_file:
-                if f: f.close()
-                current_file = newest_file
-                f = open(current_file, "r")
-                print(f"\n--- Tailing Log: {os.path.basename(current_file)} ---")
-            line = f.readline()
-            if not line:
-                time.sleep(0.1); continue
-            yield line
+            if not files: time.sleep(1); continue
+            with open(files[-1], "r") as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if not line: break
+                    yield line
     else:
-        files_to_process = [target_path] if os.path.isfile(target_path) else sorted(glob.glob(os.path.join(target_path, "*.txt")), key=os.path.getmtime)
-        print(f"[*] Offline Mode: Found {len(files_to_process)} file(s) to process.")
-        for file in files_to_process:
-            print(f"--- Processing {os.path.basename(file)} ---")
+        files = [target_path] if os.path.isfile(target_path) else sorted(glob.glob(os.path.join(target_path, "*.txt")))
+        for file in files:
             with open(file, 'r') as f:
                 for line in f: yield line
 
-# =============================================================================
-# 6. MAIN PIPELINE LOOP
-# =============================================================================
 def run_pipeline(input_path: str, levels: list, is_live: bool):
-    router = ArchiveRouter()
-    cache_a, cache_b = {}, {}
-    
-    # Initialize current_tid in the persistent state
+    router = ArchiveRouter(); cache_a, cache_b = {}, {}
     d7_timing_state = {'pps_time': 0, 'dwt_at_last_pps': 0, 'current_tid': 0}
     packet_count = 0
-    
-    print(f"[*] Target Levels: {', '.join(levels).upper()}")
-    
     try:
         for line in read_input_stream(input_path, is_live):
             if not line.strip() or line.startswith("#"): continue
@@ -306,67 +213,55 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                 stream = bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", line))
                 idx = 0
                 while idx <= len(stream) - 10:
-                    if stream[idx:idx+2] != b'\xeb\x90': 
-                        idx += 1; continue
+                    if stream[idx:idx+2] != b'\xeb\x90': idx += 1; continue
                     apid = (int.from_bytes(stream[idx+2:idx+4], "big") & 0x07FF)
                     blen = 512 if apid in [0xD6, 0xD7] else 2 + (int.from_bytes(stream[idx+6:idx+8], "big") + 7) + 2
-                    
                     p = decode_packet(stream[idx+2:idx+blen-2], apid, d7_timing_state)
                     if p:
                         time_str = p['utc'].strftime('%Y-%m-%d %H:%M:%S')
-                        tid_str = f" | TID: {p.get('tid', 0):05d}" if p['type'] == 'EVT' else ""
-                        print(f"[{time_str}] APID 0x{p['apid']:03X} ({p['type']:<3}){tid_str} | Seq: {p['pkt_count']:05d} | Extracted Rows: {len(p['l1a'])}")
-
-                        # 1. Generate L0 Raw
+                        print(f"[{time_str}] APID 0x{p['apid']:03X} ({p['type']:<3}) | Seq: {p['pkt_count']:05d} | Rows: {len(p['l1a'])}")
+                        
                         if 'l0' in levels:
-                            with open(router.get_path("L0", apid, p['utc']), "ab") as f0: 
-                                f0.write(stream[idx:idx+blen])
-                        
-                        # 2. Extract L1a
+                            with open(router.get_path("L0", apid, p['utc']), "ab") as f0: f0.write(stream[idx:idx+blen])
                         if 'l1a' in levels:
-                            pa = router.get_path("L1a", apid, p['utc'], p.get('tid',0))
-                            if pa not in cache_a: cache_a[pa] = {'rows': [], 'met_list': []}
-                            cache_a[pa]['rows'].extend(p['l1a'])
-                            cache_a[pa]['met_list'].append(p['met'])
-                        
-                        # 3. Extract L1b
+                            if p['type'] == 'EVT':
+                                for row in p['l1a']:
+                                    pa = router.get_path("L1a", apid, p['utc'], row.pop('_TID', 0))
+                                    if pa not in cache_a: cache_a[pa] = {'rows': [], 'met_list': []}
+                                    cache_a[pa]['rows'].append(row)
+                                    cache_a[pa]['met_list'].append(p['met'])
+                            else:
+                                pa = router.get_path("L1a", apid, p['utc'], p.get('tid',0))
+                                if pa not in cache_a: cache_a[pa] = {'rows': [], 'met_list': []}
+                                cache_a[pa]['rows'].extend(p['l1a'])
+                                cache_a[pa]['met_list'].append(p['met'])
                         if 'l1b' in levels:
-                            pb = router.get_path("L1b", apid, p['utc'], p.get('tid',0))
-                            if pb not in cache_b: cache_b[pb] = {'rows': [], 'met_list': []}
-                            cache_b[pb]['rows'].extend(p['l1b'])
-                            cache_b[pb]['met_list'].append(p['met'])
-                        
+                            if p['type'] == 'EVT':
+                                for row in p['l1b']:
+                                    pb = router.get_path("L1b", apid, p['utc'], row.pop('_TID', 0))
+                                    if pb not in cache_b: cache_b[pb] = {'rows': [], 'met_list': []}
+                                    cache_b[pb]['rows'].append(row)
+                                    cache_b[pb]['met_list'].append(p['met'])
+                            else:
+                                pb = router.get_path("L1b", apid, p['utc'], p.get('tid',0))
+                                if pb not in cache_b: cache_b[pb] = {'rows': [], 'met_list': []}
+                                cache_b[pb]['rows'].extend(p['l1b'])
+                                cache_b[pb]['met_list'].append(p['met'])
                         packet_count += 1
                     idx += blen
             except Exception: continue
-            
-            # THE FLUSH TRIGGER (Batch Threshold)
             if packet_count >= FLUSH_THRESHOLD:
                 if 'l1a' in levels: flush_cache_to_disk(cache_a, "L1a")
                 if 'l1b' in levels: flush_cache_to_disk(cache_b, "L1b")
                 packet_count = 0
-                
-        # Final Flush for Offline Mode
-        if not is_live:
-            print("\n[*] Input stream complete. Running final disk flush...")
-            if 'l1a' in levels: flush_cache_to_disk(cache_a, "L1a")
-            if 'l1b' in levels: flush_cache_to_disk(cache_b, "L1b")
-            print("[*] Pipeline completed successfully.")
-                
-    except KeyboardInterrupt:
-        print("\n[*] Keyboard Interrupt received. Flushing remaining data to disk...")
         if 'l1a' in levels: flush_cache_to_disk(cache_a, "L1a")
         if 'l1b' in levels: flush_cache_to_disk(cache_b, "L1b")
-        print("[*] Pipeline terminated gracefully.")
+    except KeyboardInterrupt: pass
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTO Telemetry Pipeline Tool")
-    parser.add_argument("--input", required=True, help="Path to input raw hex file or directory")
-    parser.add_argument("--level", default="all", choices=['l0', 'l1a', 'l1b', 'all'], help="Target output level (default: all)")
-    parser.add_argument("--live", choices=['yes', 'no', 'true', 'false'], default='no', help="Run as a continuous live daemon (default: no)")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--level", default="all", choices=['l0', 'l1a', 'l1b', 'all'])
+    parser.add_argument("--live", choices=['yes', 'no'], default='no')
     args = parser.parse_args()
-    
-    is_live = args.live.lower() in ['yes', 'true']
-    levels = ['l0', 'l1a', 'l1b'] if args.level.lower() == 'all' else [args.level.lower()]
-    run_pipeline(args.input, levels, is_live)
+    run_pipeline(args.input, ['l0', 'l1a', 'l1b'] if args.level == 'all' else [args.level], args.live == 'yes')
