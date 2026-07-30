@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 BTO PIPELINE
-Processes CCSDS hex logs into L0, L1a, and L1b FITS archives.
+Monitors or batch-processes CCSDS hex logs into L0, L1a, and L1b FITS archives.
 
 """
 
@@ -348,8 +348,8 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
 
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "bins": raw_bins}],
-            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNTS": raw_bins}],
+            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
+            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
         })
         return base_data
 
@@ -388,9 +388,6 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
                     # Pure empty NAND flash padding. Discard.
                     pass
                 else:
-                    # True Heartbeat (Event 1: Seq num). 
-                    # The next 2 events in memory are PPS Time and SUT Time. 
-                    # We flag the state machine to explicitly skip them.
                     d7_state["skip_next"] = 2
                 ptr += EVT_WORD_LEN
                 continue
@@ -421,10 +418,8 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             # -----------------------------------------------
             if adc_data == 0xABCD:
                 if ts_long == 0xABCD:
-                    # End Frame 1 (PPS Time). Skip the next 2 events.
                     d7_state["skip_next"] = 2
                 elif ts_long in [0xEF00, 0xEFFF]:
-                    # Failsafe: End Frame 2 (PPS Subsec) for Trigger or Calibration mode.
                     d7_state["skip_next"] = 1
                 ptr += EVT_WORD_LEN
                 continue
@@ -433,24 +428,16 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             # 4. Photon Event (Standard & Saturated)
             # -----------------------------------------------
             
-            # Extract Hardware Flags
             flag_su = (adc_data >> 15) & 1
             flag_up = (adc_data >> 14) & 1
             flag_ld = (adc_data >> 13) & 1
             flag_pseudo = (adc_data >> 12) & 1
 
-            # 12-Bit Two's Complement Conversion
             if (adc_data & 0x7FFF) == 0x7FFF:
-                # Flight software explicit overflow/saturated marker.
-                # Force it to the maximum FITS channel to prevent rollover.
                 pha = 4095 
             else:
                 pha_raw = adc_data & 0x0FFF
                 pha_signed = pha_raw - 4096 if pha_raw >= 2048 else pha_raw
-                
-                # FITS Format Correction:
-                # Taking the absolute value rectifies negative signal generator 
-                # pulses (-51mV, etc) into positive FITS channels and floors baseline noise.
                 pha = abs(pha_signed)
             
             full_timestamp = (ts_long << 16) | ts_short
@@ -475,6 +462,9 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
 
             active_tid = max(1, d7_state.get("current_tid", 1))
             
+            # Calibration calculation for L1b
+            energy_kev = max(0.0, float(pha * E_SLOPE + E_INTERCEPT))
+            
             l1a.append({
                 "TIME": evt_met,
                 "PKT_CNT": pkt_count,
@@ -490,6 +480,8 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
                 "TIME": evt_met,
                 "PKT_CNT": pkt_count,
                 "PI": pha,
+                "ENERGY": energy_kev,
+                "DEADTIME": raw_deadtime,
                 "_TID": active_tid,
             })
 
@@ -552,6 +544,20 @@ def get_eneband_hdu():
     })
     return hdu
 
+def get_gti_hdu(t_start, t_stop):
+    cols = [
+        fits.Column(name="START", format="1D", unit="s", array=[t_start]),
+        fits.Column(name="STOP", format="1D", unit="s", array=[t_stop]),
+    ]
+    hdu = fits.BinTableHDU.from_columns(cols, name="GTI")
+    hdu.header.update({
+        "EXTNAME": "GTI",
+        "HDUCLASS": "OGIP",
+        "HDUCLAS1": "GTI",
+        "HDUCLAS2": "STANDARD"
+    })
+    return hdu
+
 def make_obs_id(utc_start: datetime.datetime, is_event: bool) -> str:
     if is_event:
         return f"{utc_start.strftime('%y%m%d')}000t"
@@ -561,25 +567,33 @@ def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False,
     if obs_id is None:
         obs_id = utc_start.strftime("%y%m%d") + "000t"
 
+    date_now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    caldb_ver = f"cs{utc_start.strftime('%Y%m%d')}"
+
     header_data = {
         "TELESCOP": ("COSI", "Telescope"),
         "INSTRUME": ("BTO", "Instrument"),
+        "DETNAM": ("BTO1", "Detector name"), 
         "OBS_ID": (obs_id, "Observation ID"),
         "DATE-OBS": (utc_start.strftime("%Y-%m-%dT%H:%M:%S"), "Start"),
         "DATE-END": (utc_stop.strftime("%Y-%m-%dT%H:%M:%S"), "End"),
+        "ORIGIN": ("SSL", "Origin of fits file"),
+        "DATE": (date_now, "File creation date"),
+        "SEQNUM": (1, "Times dataset has been processed"),
+        "TLM2FITS": ("BTO_PIPELINE", "Telemetry converter"),
+        "CALDBVER": (caldb_ver, "CALDB version"),
+        "PROCVER": ("01.00.00", "Processing version"),
+        "OBSERVER": ("John Tomsick", "Principal Investigator")
     }
 
     if is_primary:
         header_data.update({
-            "ORIGIN": ("UCB/SSL", "Origin"),
-            "DATE": (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"), "Created"),
-            "CREATOR": ("BTO_LIVE_V5.23", "Software"),
+            "CREATOR": ("BTO_LIVE_V5.24", "Software"),
         })
     else:
         header_data.update({
             "HDUCLASS": ("OGIP", "Standard"),
             "DATAMODE": ("NORMAL", "Datamode"),
-            "OBSERVER": ("BTO_TEAM", "PI"),
             "OBJECT": ("CAL_SOURCE", "Target"),
             "TIMESYS": ("TT", "Time System"),
             "MJDREFI": (60676, "MJD Ref"),
@@ -597,29 +611,39 @@ def inject_metadata(hdu, t_start, t_stop, utc_start, utc_stop, is_primary=False,
 
 def _make_column(name, values):
     arr = np.array(values)
+    unit = None
 
-    if name == "TIME":
+    if name in ["TIME", "DEADTIME"]:
         fmt = "1D"
+        unit = "s"
     elif name in ["t_ext", "t_det1", "t_det2"]:
         fmt = "1E"
-    elif name in ["bins", "COUNTS"]:
+        unit = "degC"
+    elif name in ["t_ext_raw", "t_det1_raw", "t_det2_raw"]:
+        fmt = "1J"
+        unit = "ADC"
+    elif name == "COUNT":
         fmt = f"{LC_NUM_BINS}J"
+        unit = "ct"
     elif name in ["PKT_CNT", "BTO_ID", "BTO_MODE", "FSW_VER", "WD_RESET", "RESET_REASON", "FAULT_STATUS", "DET_PWR_STATUS", "ANALOG_STATUS", "FLAG_SU", "FLAG_UP", "FLAG_LD", "FLAG_PSEUDO"]:
         fmt = "1I"
     elif name in ["SUT", "CMD_CNT", "FAIL_CMD_CNT", "CS_ERR_CNT", "HIST_WPTR", "HIST_RPTR",
                   "FLASH_ERASE_FAIL", "ZC_CNT", "SU_CNT",
-                  "t_ext_raw", "t_det1_raw", "t_det2_raw",
                   "vmon_p12_1_raw", "vmon_m12_1_raw", "vmon_p12_2_raw", "vmon_m12_2_raw",
                   "imon_5v_1_raw", "imon_5v_2_raw", "spare_raw", "it_cs_raw",
                   "HIST_NAND_WPTR", "HIST_NAND_RPTR", "PHOT_NAND_WPTR", "PHOT_NAND_RPTR",
-                  "LAST_GRB_TIME", "LAST_GRB_NAND", "LAST_GRB_ID", "DEADTIME"]:
+                  "LAST_GRB_TIME", "LAST_GRB_NAND", "LAST_GRB_ID"]:
         fmt = "1J"
     elif name in ["PI", "PHA"]:
-        fmt = "1I"  # FITS 1I is inherently a SIGNED 16-bit integer
+        fmt = "1I"
+        unit = "chan"
+    elif name == "ENERGY":
+        fmt = "1E"
+        unit = "keV"
     else:
         fmt = "1J"
 
-    return fits.Column(name=name, format=fmt, array=arr)
+    return fits.Column(name=name, format=fmt, array=arr, unit=unit)
 
 def flush_cache_to_disk(cache, tier):
     for path, data in list(cache.items()):
@@ -631,16 +655,17 @@ def flush_cache_to_disk(cache, tier):
             first_row = rows[0]
 
             if "PI" in first_row or "PHA" in first_row:
-                ext_name, hdu_class = "EVENTS", "EVENTS"
+                ext_name, hdu_class = "BTO_EVENT", "EVENT"
             elif "t_ext_raw" in first_row:
                 ext_name, hdu_class = "HK", "HK"
-            elif "bins" in first_row or "COUNTS" in first_row:
-                ext_name, hdu_class = "RATE", "LIGHTCURVE"
+            elif "COUNT" in first_row:
+                ext_name, hdu_class = "BTO_SPECHIST", "LIGHTCURVE"
             else:
                 ext_name, hdu_class = "DATA", "DATA"
 
             cols = []
             for k in first_row.keys():
+                if k.startswith("_"): continue
                 values = [r[k] for r in rows]
                 cols.append(_make_column(k, values))
 
@@ -651,12 +676,15 @@ def flush_cache_to_disk(cache, tier):
             utc_start = MET_EPOCH + datetime.timedelta(seconds=t_s)
             utc_stop = MET_EPOCH + datetime.timedelta(seconds=t_e)
 
-            obs_id = utc_start.strftime("%y%m%d") + ("000t" if ext_name == "EVENTS" else "")
+            obs_id = utc_start.strftime("%y%m%d") + ("000t" if ext_name == "BTO_EVENT" else "")
             inject_metadata(new_hdu, t_s, t_e, utc_start, utc_stop, obs_id=obs_id)
             new_hdu.header.update({"HDUCLAS1": hdu_class, "HDUCLAS2": "ALL"})
 
-            if ext_name == "EVENTS" and tier == "L1b":
+            if ext_name == "BTO_EVENT" and tier == "L1b":
                 new_hdu.header.update({"CHANTYPE": "PI", "DETCHANS": MAX_CHANNELS})
+                
+            if ext_name == "BTO_SPECHIST":
+                new_hdu.header.update({"BINTYPE": "LINEAR", "TIMEDEL": 5.0})
 
             if os.path.exists(path):
                 with fits.open(path, memmap=False) as hdul:
@@ -676,24 +704,33 @@ def flush_cache_to_disk(cache, tier):
 
                     new_table.header["TSTOP"] = new_tstop
                     final_hdul = fits.HDUList([hdul[0], new_table])
+                    
+                    # Carry over any additional extensions (GTI, EBOUNDS, etc.)
                     for ext in hdul[2:]:
-                        final_hdul.append(ext.copy())
+                        ext_copy = ext.copy()
+                        if ext_copy.name == "GTI":
+                            if len(ext_copy.data) > 0:
+                                ext_copy.data["STOP"][-1] = max(ext_copy.data["STOP"][-1], t_e)
+                        final_hdul.append(ext_copy)
 
                     final_hdul[0].header["DATE-END"] = utc_stop.strftime("%Y-%m-%dT%H:%M:%S")
-                    final_hdul.writeto(path + ".tmp", overwrite=True)
+                    final_hdul.writeto(path + ".tmp", overwrite=True, checksum=True)
 
                 os.replace(path + ".tmp", path)
             else:
                 hdul = [fits.PrimaryHDU(), new_hdu]
-                inject_metadata(hdul[0], t_s, t_e, utc_start, utc_stop, is_primary=True, obs_id=obs_id)
-
+                
+                if ext_name in ["BTO_EVENT", "BTO_SPECHIST", "HK"]:
+                    hdul.append(get_gti_hdu(t_s, t_e))
+                
                 if tier == "L1b":
                     if "PI" in first_row:
                         hdul.append(get_ebounds_hdu())
-                    elif "COUNTS" in first_row:
+                    elif "COUNT" in first_row:
                         hdul.append(get_eneband_hdu())
 
-                fits.HDUList(hdul).writeto(path, overwrite=True)
+                inject_metadata(hdul[0], t_s, t_e, utc_start, utc_stop, is_primary=True, obs_id=obs_id)
+                fits.HDUList(hdul).writeto(path, overwrite=True, checksum=True)
 
             print(f"[DISK IO] {tier} Flushed {len(rows)} rows to {os.path.basename(path)}")
         except Exception as e:
@@ -763,7 +800,7 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
         "last_photon_dwt": None,
         "last_evt_met": None,
         "hk_sut": None,
-        "skip_next": 0   # Track multi-word events across packet boundaries
+        "skip_next": 0   
     }
      
     packet_count = 0
@@ -810,7 +847,7 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                 if "l1a" in levels and p.get("type") in ["EVT", "HK", "LC"]:
                     if p["type"] == "EVT":
                         for row in p["l1a"]:
-                            pa = router.get_path("L1a", apid, p["utc"], row.pop("_TID", 0))
+                            pa = router.get_path("L1a", apid, p["utc"], row.get("_TID", 0))
                             if pa not in cache_a:
                                 cache_a[pa] = {"rows": [], "met_list": []}
                             cache_a[pa]["rows"].append(row)
@@ -825,7 +862,7 @@ def run_pipeline(input_path: str, levels: list, is_live: bool):
                 if "l1b" in levels and p.get("type") in ["EVT", "HK", "LC"]:
                     if p["type"] == "EVT":
                         for row in p["l1b"]:
-                            pb = router.get_path("L1b", apid, p["utc"], row.pop("_TID", 0))
+                            pb = router.get_path("L1b", apid, p["utc"], row.get("_TID", 0))
                             if pb not in cache_b:
                                 cache_b[pb] = {"rows": [], "met_list": []}
                             cache_b[pb]["rows"].append(row)
