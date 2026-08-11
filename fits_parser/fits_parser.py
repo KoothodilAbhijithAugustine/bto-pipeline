@@ -69,6 +69,10 @@ LC_BTO_ID_OFS = 16
 LC_BINS_START = 17
 LC_BINS_STEP = 2
 LC_NUM_BINS = 29
+LC_TIMESTAMP_START = LC_BINS_START + (LC_NUM_BINS * LC_BINS_STEP)
+LC_TIMESTAMP_LEN = 12
+LC_COUNTER_START = LC_TIMESTAMP_START + LC_TIMESTAMP_LEN
+LC_COUNTER_BLOCK_LEN = 48
 
 # Event packet layout
 EVT_DATA_START = 22
@@ -346,10 +350,47 @@ def decode_packet(ccsds: bytes, apid: int, d7_state: dict):
             for i in range(LC_NUM_BINS)
         ]
 
+        # Extract 100ms Lightcurve Counters 
+        lc_zc_array = [0] * 10
+        lc_up_array = [0] * 10
+        lc_su_array = [0] * 10
+        
+        # Verify the packet is long enough to hold the discriminator block (48 bytes)
+        if len(ccsds) >= (LC_COUNTER_START + LC_COUNTER_BLOCK_LEN):
+            blocks = []
+            for i in range(12):
+                ptr = LC_COUNTER_START + i * 4
+                blocks.append(ccsds[ptr:ptr+4])
+            
+            # The firmware inserts PPS + subsec info every 10 counts.
+            # We identify the subsec block by checking if the 4th byte is 0xFF.
+            time_idx = -1
+            for i, b in enumerate(blocks):
+                if b[3] == 0xFF:
+                    time_idx = i
+                    break
+                    
+            valid_blocks = []
+            if time_idx != -1:
+                # The seconds struct comes directly before the subseconds struct in the ring buffer.
+                sec_idx = (time_idx - 1) % 12
+                for i, b in enumerate(blocks):
+                    if i != time_idx and i != sec_idx:
+                        valid_blocks.append(b)
+            else:
+                valid_blocks = blocks[:10]  # Fallback 
+                
+            for i, b in enumerate(valid_blocks[:10]):
+                lc_zc_array[i] = (b[0] << 8) | b[1]
+                lc_up_array[i] = b[2]
+                lc_su_array[i] = b[3]
+
         base_data.update({
             "type": "LC",
-            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
-            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins}],
+            "l1a": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins, 
+                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
+            "l1b": [{"TIME": packet_met, "PKT_CNT": pkt_count, "COUNT": raw_bins, 
+                     "LC_ZC_CNT": lc_zc_array, "LC_UP_CNT": lc_up_array, "LC_SU_CNT": lc_su_array}],
         })
         return base_data
 
@@ -624,6 +665,9 @@ def _make_column(name, values):
         unit = "ADC"
     elif name == "COUNT":
         fmt = f"{LC_NUM_BINS}J"
+        unit = "ct"
+    elif name in ["LC_ZC_CNT", "LC_UP_CNT", "LC_SU_CNT"]:
+        fmt = "10J"
         unit = "ct"
     elif name in ["PKT_CNT", "BTO_ID", "BTO_MODE", "FSW_VER", "WD_RESET", "RESET_REASON", "FAULT_STATUS", "DET_PWR_STATUS", "ANALOG_STATUS", "FLAG_SU", "FLAG_UP", "FLAG_LD", "FLAG_PSEUDO"]:
         fmt = "1I"
